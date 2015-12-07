@@ -69,10 +69,20 @@ def _start_engines(node, user, n_engines=None, kill_existing=False):
     """
     if n_engines is None:
         n_engines = node.num_processors
-    node.ssh.switch_user(user)
+    node.ssh.switch_user('root')
     if kill_existing:
-        node.ssh.execute("pkill -f ipengineapp", ignore_exit_status=True)
-    node.ssh.execute("ipcluster engines --n=%i --daemonize" % n_engines)
+        node.ssh.execute("pkill -9 -f ipengineapp", ignore_exit_status=True)
+        node.ssh.execute("pkill -9 -f engine", ignore_exit_status=True)
+        node.ssh.execute("pkill -9 -f controller", ignore_exit_status=True)
+        node.ssh.execute("pkill -9 -f ipcluster", ignore_exit_status=True)
+        node.ssh.execute("pkill -9 -f run_experiment", ignore_exit_status=True)
+    node.ssh.switch_user(user)
+    if node.is_master():
+        print "executing on the master"
+        node.ssh.execute("ipcluster start --n=%i --delay=5 --daemonize" % n_engines)
+    else:
+        print "executing on the client"
+        node.ssh.execute("ipcluster engines --n=%i --delay=5 --daemonize" % n_engines)
     node.ssh.switch_user('root')
 
 
@@ -91,7 +101,8 @@ class IPCluster(DefaultClusterSetup):
 
     """
     def __init__(self, enable_notebook=False, notebook_passwd=None,
-                 notebook_directory=None, packer=None, log_level='INFO'):
+                 notebook_directory=None, packer=None, engines_per_node=None,
+                 log_level='INFO'):
         super(IPCluster, self).__init__()
         if isinstance(enable_notebook, basestring):
             self.enable_notebook = enable_notebook.lower().strip() == 'true'
@@ -99,6 +110,10 @@ class IPCluster(DefaultClusterSetup):
             self.enable_notebook = enable_notebook
         self.notebook_passwd = notebook_passwd or utils.generate_passwd(16)
         self.notebook_directory = notebook_directory
+        if isinstance(engines_per_node, basestring):
+            self.engines_per_node = int(engines_per_node)
+        else:
+            self.engines_per_node = engines_per_node
         self.log_level = log_level
         if packer not in (None, 'json', 'pickle', 'msgpack'):
             log.error("Unsupported packer: %s", packer)
@@ -163,7 +178,10 @@ class IPCluster(DefaultClusterSetup):
         f.close()
 
     def _start_cluster(self, master, profile_dir):
-        n_engines = max(1, master.num_processors - 1)
+        if self.engines_per_node is None:
+            n_engines = max(1, master.num_processors - 1)
+        else:
+            n_engines = max(1, self.engines_per_node - 1)
         log.info("Starting the IPython controller and %i engines on master"
                  % n_engines)
         # cleanup existing connection files, to prevent their use
@@ -288,12 +306,19 @@ class IPCluster(DefaultClusterSetup):
         cfile, n_engines_master = self._start_cluster(master, profile_dir)
         # Start engines on each of the non-master nodes
         non_master_nodes = [node for node in nodes if not node.is_master()]
+        n_engines_non_master = 0
         for node in non_master_nodes:
-            self.pool.simple_job(
-                _start_engines, (node, user, node.num_processors),
-                jobid=node.alias)
-        n_engines_non_master = sum(node.num_processors
-                                   for node in non_master_nodes)
+            if self.engines_per_node is None:
+                self.pool.simple_job(
+                    _start_engines, (node, user, node.num_processors),
+                    jobid=node.alias)
+                n_engines_non_master += node.num_processors
+            else:
+                self.pool.simple_job(
+                    _start_engines, (node, user, self.engines_per_node),
+                    jobid=node.alias)
+                n_engines_non_master += self.engines_per_node
+
         if len(non_master_nodes) > 0:
             log.info("Adding %d engines on %d nodes",
                      n_engines_non_master, len(non_master_nodes))
@@ -310,7 +335,10 @@ class IPCluster(DefaultClusterSetup):
 
     def on_add_node(self, node, nodes, master, user, user_shell, volumes):
         self._check_ipython_installed(node)
-        n_engines = node.num_processors
+        if self.engines_per_node is None:
+            n_engines = node.num_processors
+        else:
+            n_engines = self.engines_per_node
         log.info("Adding %d engines on %s", n_engines, node.alias)
         _start_engines(node, user)
 
@@ -366,18 +394,50 @@ class IPClusterRestartEngines(DefaultClusterSetup):
       starcluster runplugin plugin_conf_name cluster_name
 
     """
+
+    def __init__(self, engines_per_node=None):
+        super(IPClusterRestartEngines, self).__init__()
+        if isinstance(engines_per_node, basestring):
+            self.engines_per_node = int(engines_per_node)
+        else:
+            self.engines_per_node = engines_per_node
+
     def run(self, nodes, master, user, user_shell, volumes):
         n_total = 0
+
         for node in nodes:
-            n_engines = node.num_processors
-            if node.is_master() and n_engines > 2:
+            if not node.is_master():
+                continue
+            if self.engines_per_node is None:
+                n_engines = node.num_processors
+            else:
+                n_engines = self.engines_per_node
+            if n_engines >= 2:
                 n_engines -= 1
             self.pool.simple_job(
                 _start_engines, (node, user, n_engines, True),
                 jobid=node.alias)
             n_total += n_engines
-        log.info("Restarting %d engines on %d nodes", n_total, len(nodes))
-        self.pool.wait(len(nodes))
+            log.info("Restarting master cluster controller")
+            self.pool.wait(1)
+            break
+
+        n_total = 0
+
+        for node in nodes:
+            if node.is_master():
+                continue
+            if self.engines_per_node is None:
+                n_engines = node.num_processors
+            else:
+                n_engines = self.engines_per_node
+
+            self.pool.simple_job(
+                _start_engines, (node, user, n_engines, True),
+                jobid=node.alias)
+            n_total += n_engines
+        log.info("Restarting %d engines on %d nodes", n_total, len(nodes) - 1)
+        self.pool.wait(len(nodes) - 1)
 
     def on_add_node(self, node, nodes, master, user, user_shell, volumes):
         raise NotImplementedError("on_add_node method not implemented")
