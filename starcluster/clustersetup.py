@@ -403,10 +403,10 @@ class DefaultClusterSetup(ClusterSetup):
         self._user_shell = user_shell
         self._volumes = volumes
         log.info("Removing node %s (%s)..." % (node.alias, node.id))
-        log.info("Removing %s from known_hosts files" % node.alias)
-        self._remove_from_known_hosts(node)
-        log.info("Removing %s from /etc/hosts" % node.alias)
-        self._remove_from_etc_hosts(node)
+        # log.info("Removing %s from known_hosts files" % node.alias)
+        # self._remove_from_known_hosts(node)
+        # log.info("Removing %s from /etc/hosts" % node.alias)
+        # self._remove_from_etc_hosts(node)
         log.info("Removing %s from NFS" % node.alias)
         self._remove_nfs_exports(node)
 
